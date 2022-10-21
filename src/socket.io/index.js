@@ -12,6 +12,12 @@ const user = require('../user');
 const logger = require('../logger');
 const plugins = require('../plugins');
 const ratelimit = require('../middleware/ratelimit');
+const { RateLimiterMemory } = require('rate-limiter-flexible');
+
+const rateLimiter = new RateLimiterMemory({
+  points: 5, // 5 points
+  duration: 1, // per second
+});
 
 const Namespaces = {};
 
@@ -62,6 +68,7 @@ Sockets.init = async function (server) {
 };
 
 function onConnection(socket) {
+  
 	socket.ip = (socket.request.headers['x-forwarded-for'] || socket.request.connection.remoteAddress || '').split(',')[0];
 	socket.request.ip = socket.ip;
 	logger.io_one(socket, socket.uid);
@@ -108,66 +115,75 @@ async function onConnect(socket) {
 }
 
 async function onMessage(socket, payload) {
-	if (!payload.data.length) {
-		return winston.warn('[socket.io] Empty payload');
-	}
+  try {
+    await rateLimiter.consume(socket.handshake.address); // consume 1 point per event from IP
 
-	const eventName = payload.data[0];
-	const params = typeof payload.data[1] === 'function' ? {} : payload.data[1];
-	const callback = typeof payload.data[payload.data.length - 1] === 'function' ? payload.data[payload.data.length - 1] : function () {};
+    if (!payload.data.length) {
+      return winston.warn('[socket.io] Empty payload');
+    }
 
-	if (!eventName) {
-		return winston.warn('[socket.io] Empty method name');
-	}
+    const eventName = payload.data[0];
+    const params = typeof payload.data[1] === 'function' ? {} : payload.data[1];
+    const callback = typeof payload.data[payload.data.length - 1] === 'function' ? payload.data[payload.data.length - 1] : function () {};
 
-	const parts = eventName.toString().split('.');
-	const namespace = parts[0];
-	const methodToCall = parts.reduce((prev, cur) => {
-		if (prev !== null && prev[cur]) {
-			return prev[cur];
-		}
-		return null;
-	}, Namespaces);
+    if (!eventName) {
+      return winston.warn('[socket.io] Empty method name');
+    }
 
-	if (!methodToCall || typeof methodToCall !== 'function') {
-		if (process.env.NODE_ENV === 'development') {
-			winston.warn(`[socket.io] Unrecognized message: ${eventName}`);
-		}
-		const escapedName = validator.escape(String(eventName));
-		return callback({ message: `[[error:invalid-event, ${escapedName}]]` });
-	}
+    const parts = eventName.toString().split('.');
+    const namespace = parts[0];
+    const methodToCall = parts.reduce((prev, cur) => {
+      if (prev !== null && prev[cur]) {
+        return prev[cur];
+      }
+      return null;
+    }, Namespaces);
 
-	socket.previousEvents = socket.previousEvents || [];
-	socket.previousEvents.push(eventName);
-	if (socket.previousEvents.length > 20) {
-		socket.previousEvents.shift();
-	}
+    if (!methodToCall || typeof methodToCall !== 'function') {
+      if (process.env.NODE_ENV === 'development') {
+        winston.warn(`[socket.io] Unrecognized message: ${eventName}`);
+      }
+      const escapedName = validator.escape(String(eventName));
+      return callback({ message: `[[error:invalid-event, ${escapedName}]]` });
+    }
 
-	if (!eventName.startsWith('admin.') && ratelimit.isFlooding(socket)) {
-		winston.warn(`[socket.io] Too many emits! Disconnecting uid : ${socket.uid}. Events : ${socket.previousEvents}`);
-		return socket.disconnect();
-	}
+    socket.previousEvents = socket.previousEvents || [];
+    socket.previousEvents.push(eventName);
+    if (socket.previousEvents.length > 20) {
+      socket.previousEvents.shift();
+    }
 
-	try {
-		await checkMaintenance(socket);
-		await validateSession(socket, '[[error:revalidate-failure]]');
+    if (!eventName.startsWith('admin.') && ratelimit.isFlooding(socket)) {
+      winston.warn(`[socket.io] Too many emits! Disconnecting uid : ${socket.uid}. Events : ${socket.previousEvents}`);
+      return socket.disconnect();
+    }
 
-		if (Namespaces[namespace].before) {
-			await Namespaces[namespace].before(socket, eventName, params);
-		}
+    try {
+      await checkMaintenance(socket);
+      await validateSession(socket, '[[error:revalidate-failure]]');
 
-		if (methodToCall.constructor && methodToCall.constructor.name === 'AsyncFunction') {
-			const result = await methodToCall(socket, params);
-			callback(null, result);
-		} else {
-			methodToCall(socket, params, (err, result) => {
-				callback(err ? { message: err.message } : null, result);
-			});
-		}
-	} catch (err) {
-		winston.error(`${eventName}\n${err.stack ? err.stack : err.message}`);
-		callback({ message: err.message });
-	}
+      if (Namespaces[namespace].before) {
+        await Namespaces[namespace].before(socket, eventName, params);
+      }
+
+      if (methodToCall.constructor && methodToCall.constructor.name === 'AsyncFunction') {
+        const result = await methodToCall(socket, params);
+        callback(null, result);
+      } else {
+        methodToCall(socket, params, (err, result) => {
+          callback(err ? { message: err.message } : null, result);
+        });
+      }
+    } catch (err) {
+      winston.error(`${eventName}\n${err.stack ? err.stack : err.message}`);
+      callback({ message: err.message });
+    }
+  } catch(rejRes) {
+    // no available points to consume
+    // emit error or warning message
+    console.log(`SOCKET USER LIMITED: ${socket.handshake.address}, retry in ${rejRes.msBeforeNext}`)
+    socket.emit('blocked', { 'retry-ms': rejRes.msBeforeNext });
+  }
 }
 
 function requireModules() {
